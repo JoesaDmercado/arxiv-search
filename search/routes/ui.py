@@ -121,6 +121,23 @@ def service_status() -> Union[str, Response]:
     return health_check()
 
 
+@blueprint.route('<string:groups_or_archives>', methods=['GET'])
+def simple_archive_search(archives: str) -> Union[str, Response]:
+    """Short-cut for simple search with archive(s) pre-selected."""
+    response, code, headers = \
+        simple.archive_search(request.args, archives)
+    logger.debug(f"controller returned code: {code}")
+    if code == status.HTTP_200_OK:
+        return render_template(
+            "search/search.html",
+            pagetitle="Search",
+            **response
+        )
+    elif (code == status.HTTP_301_MOVED_PERMANENTLY
+          or code == status.HTTP_303_SEE_OTHER):
+        return redirect(headers['Location'], code=code)
+    raise InternalServerError('Unexpected error')
+
 def _browse_url(name: str, **parameters: Any) -> Optional[str]:
     """Generate a URL for a browse route."""
     paper_id = parameters.get('paper_id')

@@ -13,7 +13,7 @@ from werkzeug.exceptions import InternalServerError, NotFound, BadRequest
 from werkzeug import MultiDict, ImmutableMultiDict
 from flask import url_for
 
-from arxiv import status, identifier
+from arxiv import status, identifier, taxonomy
 
 from arxiv.base import logging
 from search.services import index, fulltext, metadata
@@ -63,106 +63,74 @@ def search(request_params: MultiDict) -> Response:
     if isinstance(request_params, ImmutableMultiDict):
         request_params = MultiDict(request_params.items(multi=True))
 
-    logger.debug('simple search form')
+    logger.debug('simple search request')
     response_data = {}  # type: Dict[str, Any]
 
-    logger.debug('simple search request')
+    # First check if the URL includes an arXiv ID.
     if 'query' in request_params:
         try:
-            # first check if the URL includes an arXiv ID
-            arxiv_id: Optional[str] = identifier.parse_arxiv_id(
-                request_params['query']
-            )
+            arxiv_id: str = identifier.parse_arxiv_id(request_params['query'])
             # If so, redirect.
             logger.debug(f"got arXiv ID: {arxiv_id}")
+            return {}, status.HTTP_301_MOVED_PERMANENTLY, \
+                {'Location': f'https://arxiv.org/abs/{arxiv_id}'}
         except ValueError as e:
-            logger.debug('No arXiv ID detected; fall back to form')
-            arxiv_id = None
-    else:
-        arxiv_id = None
-
-    if arxiv_id:
-        return {}, status.HTTP_301_MOVED_PERMANENTLY,\
-            {'Location': f'https://arxiv.org/abs/{arxiv_id}'}
+            logger.debug('no arXiv ID detected; fall back to form')
 
     # Here we intervene on the user's query to look for holdouts from the
     # classic search system's author indexing syntax (surname_f). We
     # rewrite with a comma, and show a warning to the user about the
     # change.
-    response_data['has_classic_format'] = False
-    if 'searchtype' in request_params and 'query' in request_params:
-        if request_params['searchtype'] in ['author', 'all']:
-            _query, _classic = catch_underscore_syntax(request_params['query'])
-            response_data['has_classic_format'] = _classic
-            request_params['query'] = _query
+    request_params, response_data['has_classic_format'] = \
+        _correct_classic_author_query(request_params)
 
     # Fall back to form-based search.
     form = SimpleSearchForm(request_params)
 
-    if form.query.data:
-        # Temporary workaround to support classic help search
-        if form.searchtype.data == 'help':
-            return {}, status.HTTP_301_MOVED_PERMANENTLY,\
-                {'Location': 'https://arxiv.org/help/search?method=and'
-                 f'&format=builtin-short&sort=score&words={form.query.data}'}
-
-        # Support classic "expeirmental" search
-        elif form.searchtype.data == 'full_text':
-            return {}, status.HTTP_301_MOVED_PERMANENTLY,\
-                {'Location': 'http://search.arxiv.org:8081/'
-                             f'?in=&query={form.query.data}'}
+    # The user may have selected the help pages, or experimental fulltext
+    # search, which are external to this application.
+    external_redirect = _handle_external_queries(form)
+    if external_redirect:
+        return external_redirect
 
     q: Optional[Query]
     if form.validate():
         logger.debug('form is valid')
-        q = _query_from_form(form)
+        q = _get_query(form, request_params)
 
-        # Pagination is handled outside of the form.
-        q = paginate(q, request_params)
-
-        try:
-            # Execute the search. We'll use the results directly in
-            #  template rendering, so they get added directly to the
-            #  response content.
-            response_data.update(asdict(index.search(q)))
-        except index.IndexConnectionError as e:
-            # There was a (hopefully transient) connection problem. Either
-            #  this will clear up relatively quickly (next request), or
-            #  there is a more serious outage.
-            logger.error('IndexConnectionError: %s', e)
-            raise InternalServerError(
-                "There was a problem connecting to the search index. This is "
-                "quite likely a transient issue, so please try your search "
-                "again. If this problem persists, please report it to "
-                "help@arxiv.org."
-            ) from e
-        except index.QueryError as e:
-            # Base exception routers should pick this up and show bug page.
-            logger.error('QueryError: %s', e)
-            raise InternalServerError(
-                "There was a problem executing your query. Please try your "
-                "search again.  If this problem persists, please report it to "
-                "help@arxiv.org."
-            ) from e
-
-        except Exception as e:
-            logger.error('Unhandled exception: %s', str(e))
-            raise
+        # Execute the search. We'll use the results directly in
+        #  template rendering, so they get added directly to the
+        #  response content.
+        response_data.update(_execute_search(q))
     else:
         logger.debug('form is invalid: %s', str(form.errors))
-        if 'order' in form.errors or 'size' in form.errors:
-            # It's likely that the user tried to set these parameters manually,
-            # or that the search originated from somewhere else (and was
-            # configured incorrectly).
-            simple_url = url_for('ui.search')
-            raise BadRequest(
-                f"It looks like there's something odd about your search"
-                f" request. Please try <a href='{simple_url}'>starting"
-                f" over</a>.")
+        # The user (or someone else) may have tried something clever.
+        _check_for_tampering(form)      # Raises 400 if request is funky.
         q = None
     response_data['query'] = q
     response_data['form'] = form
     return response_data, status.HTTP_200_OK, {}
+
+
+def archive_search(params: MultiDict, archives: str) -> Response:
+    """."""
+    valid_archives = []
+    for archive in archives.split(','):
+        if archive not in taxonomy.ARCHIVES:
+            logger.debug('archive %s not found in taxonomy', archive)
+            continue
+        # Support old archives.
+        if archive in taxonomy.ARCHIVES_SUBSUMED:
+            category = taxonomy.CATEGORIES[taxonomy.ARCHIVES_SUBSUMED[archive]]
+            archive = category['in_archive']
+        valid_archives.append(archive)
+
+    if len(valid_archives) == 0:
+        logger.debug('No valid archives in request')
+        raise NotFound('No such archive.')
+
+    logger.debug('Request for %i valid archives', len(valid_archives))
+
 
 
 def retrieve_document(document_id: str) -> Response:
@@ -239,3 +207,79 @@ def _query_from_form(form: SimpleSearchForm) -> SimpleQuery:
     if order and order != 'None':
         q.order = order
     return q
+
+
+def _correct_classic_author_query(request_params: MultiDict) -> MultiDict:
+    has_classic_format = False
+    if 'searchtype' in request_params and 'query' in request_params:
+        if request_params['searchtype'] in ['author', 'all']:
+            _query, _classic = catch_underscore_syntax(request_params['query'])
+            has_classic_format = _classic
+            request_params['query'] = _query
+    return request_params, has_classic_format
+
+
+def _get_query(form: SimpleSearchForm, request_params: MultiDict) \
+        -> SimpleQuery:
+    """Get a SimpleQuery instance based on the form and request params."""
+    q = _query_from_form(form)
+
+    # Pagination is handled outside of the form.
+    q = paginate(q, request_params)
+    return q
+
+
+def _execute_search(q: SimpleQuery) -> dict:
+    """Dispatch the search to the index, and handle any exceptions."""
+    try:
+        return asdict(index.search(q))
+    except index.IndexConnectionError as e:
+        # There was a (hopefully transient) connection problem. Either
+        #  this will clear up relatively quickly (next request), or
+        #  there is a more serious outage.
+        logger.error('IndexConnectionError: %s', e)
+        raise InternalServerError(
+            "There was a problem connecting to the search index. This is "
+            "quite likely a transient issue, so please try your search "
+            "again. If this problem persists, please report it to "
+            "help@arxiv.org."
+        ) from e
+    except index.QueryError as e:
+        # Base exception routers should pick this up and show bug page.
+        logger.error('QueryError: %s', e)
+        raise InternalServerError(
+            "There was a problem executing your query. Please try your "
+            "search again.  If this problem persists, please report it to "
+            "help@arxiv.org."
+        ) from e
+
+    except Exception as e:
+        logger.error('Unhandled exception: %s', str(e))
+        raise
+
+
+def _check_for_tampering(form: SimpleSearchForm) -> None:
+    if 'order' in form.errors or 'size' in form.errors:
+        # It's likely that the user tried to set these parameters manually,
+        # or that the search originated from somewhere else (and was
+        # configured incorrectly).
+        simple_url = url_for('ui.search')
+        raise BadRequest(
+            f"It looks like there's something odd about your search"
+            f" request. Please try <a href='{simple_url}'>starting"
+            f" over</a>.")
+
+
+def _handle_external_queries(form: SimpleSearchForm) -> Optional[Response]:
+    if form.query.data:
+        # Temporary workaround to support classic help search
+        if form.searchtype.data == 'help':
+            return {}, status.HTTP_301_MOVED_PERMANENTLY,\
+                {'Location': 'https://arxiv.org/help/search?method=and'
+                 f'&format=builtin-short&sort=score&words={form.query.data}'}
+
+        # Support classic "expeirmental" search
+        elif form.searchtype.data == 'full_text':
+            return {}, status.HTTP_301_MOVED_PERMANENTLY,\
+                {'Location': 'http://search.arxiv.org:8081/'
+                             f'?in=&query={form.query.data}'}

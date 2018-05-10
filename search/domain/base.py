@@ -150,14 +150,8 @@ class SimpleQuery(Query):
     search_field: str = field(default_factory=str)
     value: str = field(default_factory=str)
 
-    group: Optional[str] = field(default=None)
-    """If provided, results should be limited (by primary) to this group."""
-
-    archive: Optional[str] = field(default=None)
-    """If provided, results should be limited (by primary) to this archive."""
-
-    category: Optional[str] = field(default=None)
-    """If provided, results should be limited (by primary) to this category."""
+    archives: List[str] = field(default_factory=list)
+    """If provided, results should be limited to these archive."""
 
 
 @dataclass(init=True)
