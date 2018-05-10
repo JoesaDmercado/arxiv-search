@@ -6,7 +6,7 @@ from wtforms import Form, BooleanField, StringField, SelectField, validators, \
     FormField, SelectMultipleField, DateField, ValidationError, FieldList, \
     widgets
 from wtforms.fields import HiddenField
-
+from arxiv import taxonomy
 from search.controllers.util import doesNotStartWithWildcard, stripWhiteSpace
 
 
@@ -43,6 +43,9 @@ class SimpleSearchForm(Form):
         ('submitted_date', 'Submission date (oldest first)'),
         ('', 'Relevance')
     ], validators=[validators.Optional()], default='-announced_date_first')
+
+    GROUP_CHOICES = [('', 'All')] + [(group, group['name']) for group, description in taxonomy.GROUPS.items()]
+    group = SelectField('Group', choices=GROUP_CHOICES)
 
     def validate_query(form: Form, field: StringField) -> None:
         """Validate the length of the querystring, if searchtype is set."""
